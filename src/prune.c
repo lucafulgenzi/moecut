@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #define COPY_BUF_SIZE (1024 * 1024)
 
@@ -35,13 +36,21 @@ static void parse_args(int argc, char ** argv, struct prune_args * out) {
         if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) {
             out->profile_path = argv[++i];
         } else if (strcmp(argv[i], "--keep") == 0 && i + 1 < argc) {
-            out->keep = atoi(argv[++i]);
+            char * end = NULL;
+            const long keep = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != 0 || keep <= 0 || keep > INT_MAX) {
+                mc_die("--keep requires a positive integer");
+            }
+            out->keep = (int) keep;
         } else {
             mc_die("unknown prune argument '%s'", argv[i]);
         }
     }
     if (!out->profile_path) mc_die("prune requires --profile <profile.json>");
     if (out->keep <= 0) mc_die("prune requires --keep N with N > 0");
+    if (strcmp(out->in_path, out->out_path) == 0) {
+        mc_die("input and output paths must be different");
+    }
 }
 
 static void set_same_int_type(struct gguf_context * dst, const struct gguf_context * src, const char * key, int64_t val) {
@@ -166,6 +175,9 @@ int mc_cmd_prune(int argc, char ** argv) {
     if (!mc_kv_int(in_gguf, key, &expert_count) || expert_count <= 0) {
         mc_die("cannot read positive %s expert_count", arch);
     }
+    if (expert_count > INT_MAX) {
+        mc_die("%s.expert_count is too large: %" PRId64, arch, expert_count);
+    }
     snprintf(key, sizeof(key), "%s.expert_used_count", arch);
     mc_kv_int(in_gguf, key, &expert_used_count);
     snprintf(key, sizeof(key), "%s.expert_group_count", arch);
@@ -265,7 +277,7 @@ int mc_cmd_prune(int argc, char ** argv) {
     }
 
     if (fclose(out) != 0) mc_die("%s: close failed: %s", args.out_path, strerror(errno));
-    fclose(in);
+    if (fclose(in) != 0) mc_die("%s: close failed: %s", args.in_path, strerror(errno));
     free(buf);
 
     printf("pruned %" PRId64 " tensors (%d expert/router tensors), expert_count %" PRId64 " -> %d\n",

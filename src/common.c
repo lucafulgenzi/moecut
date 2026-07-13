@@ -1,10 +1,10 @@
 #include "common.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 
 // ---- errors ----------------------------------------------------------------
 
@@ -111,7 +111,7 @@ struct js {
 };
 
 static void js_err(struct js * j, const char * what) {
-    mc_die("%s: invalid profile JSON: %s at byte %zd", j->path, what, (ssize_t)(j->p - j->start));
+    mc_die("%s: invalid profile JSON: %s at byte %td", j->path, what, j->p - j->start);
 }
 
 static void js_ws(struct js * j) {
@@ -141,7 +141,11 @@ static char * js_string(struct js * j) {
         j->p++;
     }
     if (j->p >= j->end) js_err(j, "unterminated string");
-    char * s = strndup(start, (size_t)(j->p - start));
+    const size_t n = (size_t)(j->p - start);
+    char * s = malloc(n + 1);
+    if (!s) mc_die("out of memory");
+    memcpy(s, start, n);
+    s[n] = 0;
     j->p++; // closing quote
     return s;
 }
@@ -188,10 +192,16 @@ static double * js_num_array(struct js * j, int * n) {
     js_expect(j, '[');
     int cap = 64, cnt = 0;
     double * v = malloc(cap * sizeof(double));
+    if (!v) mc_die("out of memory");
     js_ws(j);
     if (!js_lit(j, ']')) {
         do {
-            if (cnt == cap) { cap *= 2; v = realloc(v, cap * sizeof(double)); }
+            if (cnt == cap) {
+                cap *= 2;
+                double * nv = realloc(v, cap * sizeof(double));
+                if (!nv) mc_die("out of memory");
+                v = nv;
+            }
             v[cnt++] = js_number(j);
         } while (js_lit(j, ','));
         js_expect(j, ']');
@@ -208,22 +218,34 @@ static int cmp_layer(const void * a, const void * b) {
 struct mc_profile * mc_profile_load(const char * path) {
     FILE * f = fopen(path, "rb");
     if (!f) {
-        mc_die("cannot open profile '%s'", path);
+        mc_die("cannot open profile '%s': %s", path, strerror(errno));
     }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        mc_die("cannot seek profile '%s': %s", path, strerror(errno));
+    }
     const long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (sz < 0) {
+        mc_die("cannot tell profile size for '%s': %s", path, strerror(errno));
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        mc_die("cannot seek profile '%s': %s", path, strerror(errno));
+    }
     char * buf = malloc((size_t) sz + 1);
+    if (!buf) mc_die("out of memory");
     if (fread(buf, 1, (size_t) sz, f) != (size_t) sz) {
         mc_die("cannot read profile '%s'", path);
     }
     buf[sz] = 0;
-    fclose(f);
+    if (fclose(f) != 0) {
+        mc_die("cannot close profile '%s': %s", path, strerror(errno));
+    }
 
     struct js j = { buf, buf, buf + sz, path };
     struct mc_profile * prof = calloc(1, sizeof(*prof));
+    if (!prof) mc_die("out of memory");
     int cap = 16;
     prof->layers = malloc(cap * sizeof(prof->layers[0]));
+    if (!prof->layers) mc_die("out of memory");
 
     js_expect(&j, '{');
     js_ws(&j);
@@ -253,6 +275,7 @@ struct mc_profile * mc_profile_load(const char * path) {
                         int n = 0;
                         double * v = js_num_array(&j, &n);
                         lp.rank = malloc(n * sizeof(int));
+                        if (!lp.rank) mc_die("out of memory");
                         for (int i = 0; i < n; i++) lp.rank[i] = (int) v[i];
                         rank_n = n;
                         if (lp.n_expert == 0) lp.n_expert = n;
@@ -274,6 +297,7 @@ struct mc_profile * mc_profile_load(const char * path) {
             }
             // rank must be a permutation of 0..n_expert-1
             char * seen = calloc((size_t) lp.n_expert, 1);
+            if (!seen) mc_die("out of memory");
             for (int i = 0; i < lp.n_expert; i++) {
                 const int e = lp.rank[i];
                 if (e < 0 || e >= lp.n_expert || seen[e]) {
@@ -283,7 +307,12 @@ struct mc_profile * mc_profile_load(const char * path) {
             }
             free(seen);
 
-            if (prof->n_layers == cap) { cap *= 2; prof->layers = realloc(prof->layers, cap * sizeof(prof->layers[0])); }
+            if (prof->n_layers == cap) {
+                cap *= 2;
+                struct mc_layer_profile * nl = realloc(prof->layers, cap * sizeof(prof->layers[0]));
+                if (!nl) mc_die("out of memory");
+                prof->layers = nl;
+            }
             prof->layers[prof->n_layers++] = lp;
         } while (js_lit(&j, ','));
         js_expect(&j, '}');

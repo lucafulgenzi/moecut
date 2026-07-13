@@ -1,5 +1,8 @@
 #include "common.h"
 
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,9 +74,19 @@ static int cmp_rank_desc(const void * a, const void * b) {
     return (y->score > x->score) - (y->score < x->score);
 }
 
+static void read_f32(FILE * f, const char * path, uint64_t off, float * out, size_t n) {
+    if (fseeko(f, (off_t) off, SEEK_SET) != 0) {
+        mc_die("%s: seek failed: %s", path, strerror(errno));
+    }
+    if (n > 0 && fread(out, sizeof(float), n, f) != n) {
+        mc_die("%s: truncated input while reading imatrix tensor data", path);
+    }
+}
+
 static void add_imatrix_source(
         struct layer_acc ** layers, int * n_layers, int * cap_layers,
-        struct ggml_context * gctx, const struct ggml_tensor * counts_t) {
+        const struct gguf_context * gguf, struct ggml_context * gctx,
+        FILE * f, const char * path, int64_t counts_id, const struct ggml_tensor * counts_t) {
     char base[GGML_MAX_NAME];
     if (!strip_suffix(ggml_get_name(counts_t), ".counts", base, sizeof(base))) {
         return;
@@ -88,24 +101,33 @@ static void add_imatrix_source(
         return;
     }
 
+    if (counts_t->ne[0] > INT_MAX) {
+        mc_die("too many experts in %s: %" PRId64, ggml_get_name(counts_t), counts_t->ne[0]);
+    }
     const int n_expert = (int) counts_t->ne[0];
     struct layer_acc * l = get_layer(layers, n_layers, cap_layers, layer, n_expert);
-    const float * counts = (const float *) counts_t->data;
+    float * counts = malloc((size_t) n_expert * sizeof(counts[0]));
+    if (!counts) mc_die("out of memory");
+    read_f32(f, path,
+             (uint64_t) gguf_get_data_offset(gguf) + (uint64_t) gguf_get_tensor_offset(gguf, counts_id),
+             counts, (size_t) n_expert);
 
     char sum_name[GGML_MAX_NAME + 16];
     const int sum_name_len = snprintf(sum_name, sizeof(sum_name), "%s.in_sum2", base);
     const struct ggml_tensor * sum_t = NULL;
+    int64_t sum_id = -1;
     if (sum_name_len < 0 || sum_name_len >= (int) sizeof(sum_name)) {
         mc_warn("ignoring %s: derived in_sum2 tensor name is too long", base);
     } else {
         sum_t = ggml_get_tensor(gctx, sum_name);
+        sum_id = gguf_find_tensor(gguf, sum_name);
     }
-    const float * sum2 = NULL;
     int64_t row_size = 0;
-    if (sum_t) {
+    uint64_t sum_base = 0;
+    if (sum_t && sum_id >= 0) {
         if (sum_t->type == GGML_TYPE_F32 && sum_t->ne[1] == n_expert) {
-            sum2 = (const float *) sum_t->data;
             row_size = sum_t->ne[0];
+            sum_base = (uint64_t) gguf_get_data_offset(gguf) + (uint64_t) gguf_get_tensor_offset(gguf, sum_id);
         } else {
             mc_warn("ignoring %s: expected F32 [row_size, n_expert]", sum_name);
         }
@@ -117,6 +139,7 @@ static void add_imatrix_source(
     }
     if (total_counts <= 0.0) {
         mc_warn("skipping %s: all counts are zero", ggml_get_name(counts_t));
+        free(counts);
         return;
     }
 
@@ -124,14 +147,19 @@ static void add_imatrix_source(
     int active = 0;
     double * energy = calloc((size_t) n_expert, sizeof(energy[0]));
     if (!energy) mc_die("out of memory");
+    float * row = row_size > 0 ? malloc((size_t) row_size * sizeof(row[0])) : NULL;
+    if (row_size > 0 && !row) mc_die("out of memory");
     for (int e = 0; e < n_expert; e++) {
         if (counts[e] <= 0.0f) {
             continue;
         }
-        if (sum2 && row_size > 0) {
+        if (row_size > 0) {
+            // Sum2 can be large in real imatrix files. Read one expert row at
+            // a time so profiling does not mirror the full GGUF blob in RAM.
+            read_f32(f, path, sum_base + (uint64_t) e * (uint64_t) row_size * sizeof(float), row, (size_t) row_size);
             double s = 0.0;
             for (int64_t c = 0; c < row_size; c++) {
-                s += sum2[(int64_t) e * row_size + c];
+                s += row[c];
             }
             energy[e] = s / ((double) counts[e] * (double) row_size);
         } else {
@@ -155,7 +183,9 @@ static void add_imatrix_source(
         l->e[e].score += score;
     }
     l->n_sources++;
+    free(row);
     free(energy);
+    free(counts);
 }
 
 int mc_cmd_profile(int argc, char ** argv) {
@@ -165,19 +195,25 @@ int mc_cmd_profile(int argc, char ** argv) {
 
     struct ggml_context * gctx = NULL;
     struct gguf_init_params params = {
-        .no_alloc = false,
+        .no_alloc = true,
         .ctx = &gctx,
     };
     struct gguf_context * gguf = gguf_init_from_file(argv[1], params);
     if (!gguf || !gctx) {
         mc_die("cannot read imatrix GGUF '%s'", argv[1]);
     }
+    FILE * f = fopen(argv[1], "rb");
+    if (!f) mc_die("cannot open imatrix GGUF '%s': %s", argv[1], strerror(errno));
 
     struct layer_acc * layers = NULL;
     int n_layers = 0;
     int cap_layers = 0;
-    for (struct ggml_tensor * t = ggml_get_first_tensor(gctx); t; t = ggml_get_next_tensor(gctx, t)) {
-        add_imatrix_source(&layers, &n_layers, &cap_layers, gctx, t);
+    const int64_t n_tensors = gguf_get_n_tensors(gguf);
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        struct ggml_tensor * t = ggml_get_tensor(gctx, name);
+        if (!t) mc_die("internal error: tensor '%s' missing from ggml context", name);
+        add_imatrix_source(&layers, &n_layers, &cap_layers, gguf, gctx, f, argv[1], i, t);
     }
     if (n_layers == 0) {
         mc_die("%s: no MoE expert .counts tensors found", argv[1]);
@@ -236,6 +272,7 @@ int mc_cmd_profile(int argc, char ** argv) {
 
     for (int i = 0; i < n_layers; i++) free(layers[i].e);
     free(layers);
+    if (fclose(f) != 0) mc_die("%s: close failed: %s", argv[1], strerror(errno));
     gguf_free(gguf);
     ggml_free(gctx);
     return 0;

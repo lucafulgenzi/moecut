@@ -33,6 +33,9 @@ moecut prune <in.gguf> <out.gguf> --profile <profile.json> --keep N
 `profile` writes JSON to stdout. `prune` reads that JSON and keeps the top `N`
 experts per layer according to the profile rank.
 
+`profile` reads imatrix tensor data in bounded chunks; it does not load the full
+imatrix blob into memory.
+
 ## Supported Path
 
 Currently supported:
