@@ -36,6 +36,58 @@ experts per layer according to the profile rank.
 `profile` reads imatrix tensor data in bounded chunks; it does not load the full
 imatrix blob into memory.
 
+## Download GGUF Models
+
+The helper script `scripts/hf-gguf-download.sh` downloads one GGUF file from a
+Hugging Face model repository.
+
+Requirements:
+
+* Bash 4 or newer.
+* `jq`.
+* `curl` or `wget`.
+* Standard Linux userland tools such as `mkdir`.
+
+Install the script dependencies on Debian/Ubuntu:
+
+```bash
+sudo apt install jq curl
+```
+
+Or, if you prefer `wget`:
+
+```bash
+sudo apt install jq wget
+```
+
+Pass a repository id, a Hugging Face URL, or a search string:
+
+```bash
+scripts/hf-gguf-download.sh unsloth/Qwen3-30B-A3B-GGUF
+scripts/hf-gguf-download.sh https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF
+scripts/hf-gguf-download.sh "Qwen3 30B GGUF"
+```
+
+The script lists available `.gguf` files, shows the quantization label inferred
+from each filename, and prompts for the file to download. Use `--out DIR` to
+choose an output directory, `--revision REV` for a non-`main` branch, and
+`HF_TOKEN` or `--token TOKEN` for gated/private repositories.
+
+To download a specific quantization, pass the exact GGUF filename:
+
+```bash
+scripts/hf-gguf-download.sh \
+  --file Qwen3-30B-A3B-Q4_K_M.gguf \
+  lmstudio-community/Qwen3-30B-A3B-GGUF
+```
+
+The same works with Hugging Face's `show_file_info` URLs:
+
+```bash
+scripts/hf-gguf-download.sh \
+  'https://huggingface.co/lmstudio-community/Qwen3-30B-A3B-GGUF?show_file_info=Qwen3-30B-A3B-Q4_K_M.gguf'
+```
+
 ## Supported Path
 
 Currently supported:
